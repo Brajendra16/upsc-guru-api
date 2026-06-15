@@ -1,72 +1,71 @@
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+import axios from 'axios';
+import { API } from '../config/constants';
+import { logError } from '../utils/errorHandler';
+import { groqRateLimiter } from '../utils/rateLimiter';
 
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'GROQ_API_KEY not configured' });
+interface AskGroqResponse {
+  reply: string; // grok.js chat mode returns { reply: ... }
+}
 
-  const { messages, systemPrompt, topic, mode } = req.body || {};
+interface AxiosError {
+  response?: {
+    status?: number;
+    data?: {
+      error?: string;
+    };
+  };
+  message?: string;
+}
 
-  // MCQ generation mode
-  if (topic || mode === 'mcq') {
-    const selectedTopic = topic || 'Indian History';
-    const prompt = `Generate exactly 10 multiple choice questions for UPSC Civil Services exam on the topic: "${selectedTopic}".
+/**
+ * Call Groq API via Vercel serverless function (api/grok.js).
+ * API key stays on the server — never shipped in the app.
+ */
+export async function askGroq(message: string): Promise<string> {
+  // Check rate limit before making request
+  if (!groqRateLimiter.isAllowed('groq')) {
+    const remaining = groqRateLimiter.getResetTime('groq');
+    const waitTime = remaining ? Math.ceil((remaining - Date.now()) / 1000) : 60;
+    throw new Error(`Rate limit exceeded. Please wait ${waitTime} seconds before trying again.`);
+  }
 
-Return ONLY a valid JSON array. Start directly with [ and end with ]. No text before or after.
-Each object must have exactly these fields:
-{
-  "questionNumber": 1,
-  "question": "question text",
-  "options": { "A": "option", "B": "option", "C": "option", "D": "option" },
-  "correctAnswer": "A",
-  "explanation": "brief explanation",
-  "topic": "${selectedTopic}"
-}`;
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1500;
 
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'user', content: prompt }],
-          max_tokens: 4096,
-          temperature: 0.7,
-        }),
-      });
-      const d = await r.json();
-      const text = d?.choices?.[0]?.message?.content || '';
-      const clean = text.replace(/```json|```/g, '').trim();
-      const s = clean.indexOf('['), e = clean.lastIndexOf(']');
-      if (s === -1 || e === -1) return res.status(502).json({ error: 'Invalid response from Groq' });
-      const questions = JSON.parse(clean.slice(s, e + 1));
-      return res.status(200).json({ questions, topic: selectedTopic, source: 'groq' });
-    } catch (e) {
-      return res.status(500).json({ error: e.message });
+      const response = await axios.post<AskGroqResponse>(
+        API.GROQ_SERVER,
+        {
+          // grok.js chat mode expects { messages, systemPrompt }
+          messages: [{ role: 'user', content: message }],
+          systemPrompt:
+            'You are a UPSC Civil Services exam expert. Answer clearly and concisely, focused on the Indian context. Use bullet points where helpful.',
+        },
+        { timeout: 30_000 }
+      );
+
+      // grok.js returns { reply: "..." } for chat mode
+      const text = response.data.reply;
+      if (!text) throw new Error('Empty response from AI');
+      return text;
+    } catch (error: unknown) {
+      logError('askGroq', error);
+
+      const axiosError = error as AxiosError;
+
+      if (attempt === MAX_RETRIES) {
+        throw new Error(
+          axiosError.response?.data?.error ||
+            axiosError.message ||
+            'Failed to get AI response. Please try again.'
+        );
+      }
+
+      // Exponential back-off between retries
+      await new Promise((r) => setTimeout(r, RETRY_DELAY * attempt));
     }
   }
 
-  // Chat mode (existing AI assistant feature)
-  try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-          ...(messages || []),
-        ],
-        max_tokens: 1024,
-        temperature: 0.7,
-      }),
-    });
-    const d = await r.json();
-    return res.status(200).json({ reply: d?.choices?.[0]?.message?.content || '' });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
+  throw new Error('Failed to get AI response after multiple attempts.');
 }
